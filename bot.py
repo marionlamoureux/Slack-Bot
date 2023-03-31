@@ -1,182 +1,111 @@
-import slack
+
+#!pip install boto3
+#!pip install slack
+#!pip install flask
+#!pip install slackeventsapi
+
+import csv
+import json
 import os
+import re
+import uuid
+
+import slack_sdk.web
+import boto3
+
+from datetime import datetime
 from pathlib import Path
-from dotenv import load_dotenv
+
 from flask import Flask, request, Response
 from slackeventsapi import SlackEventAdapter
-import string
-from datetime import datetime, timedelta
-import time
 
-load_dotenv()
 
 app = Flask(__name__)
 slack_event_adapter = SlackEventAdapter(
-    os.environ['SIGNING_SECRET_'], '/slack/events', app)
+  os.environ["SIGNING_SECRET_"],
+  "/slack/events", app)
 
-client = slack.WebClient(token=os.environ['SLACK_TOKEN_'])
-BOT_ID = client.api_call("auth.test")['user_id']
+BUCKET = "tothemoon-dl"
+FOLDER = "my-data/moon-landing/slack"
 
-message_counts = {}
-welcome_messages = {}
-
-BAD_WORDS = ['hmm', 'no', 'tim']
-
-SCHEDULED_MESSAGES = [
-    {'text': 'First message', 'post_at': (
-        datetime.now() + timedelta(seconds=20)).timestamp(), 'channel': 'C01BXQNT598'},
-    {'text': 'Second Message!', 'post_at': (
-        datetime.now() + timedelta(seconds=30)).timestamp(), 'channel': 'C01BXQNT598'}
-]
+s3 = boto3.resource(
+    service_name='s3',
+    region_name='us-east-1',
+    aws_access_key_id=os.environ['S3_ACCESS_KEY'],
+    aws_secret_access_key=os.environ["S3_SECRET_KEY"]
+)
 
 
-class WelcomeMessage:
-    START_TEXT = {
-        'type': 'section',
-        'text': {
-            'type': 'mrkdwn',
-            'text': (
-                'Welcome to this awesome channel! \n\n'
-                '*Get started by completing the tasks!*'
-            )
-        }
-    }
+# We will use this to check each message that comes in.
+meme_list = [
+  "BBBY",
+  "AMC",
+  "GME",
+  "TSLA",
+  "NOKIA",
+  "BB",
+  "PLTR",
+  "SPCE",
+  "Bitcoin"]
+meme_patt_string = "(" + "|".join(meme_list) + ")"
+meme_patt = re.compile(meme_patt_string)
 
-    DIVIDER = {'type': 'divider'}
-
-    def __init__(self, channel):
-        self.channel = channel
-        self.icon_emoji = ':robot_face:'
-        self.timestamp = ''
-        self.completed = False
-
-    def get_message(self):
-        return {
-            'ts': self.timestamp,
-            'channel': self.channel,
-            'username': 'Welcome Robot!',
-            'icon_emoji': self.icon_emoji,
-            'blocks': [
-                self.START_TEXT,
-                self.DIVIDER,
-                self._get_reaction_task()
-            ]
-        }
-
-    def _get_reaction_task(self):
-        checkmark = ':white_check_mark:'
-        if not self.completed:
-            checkmark = ':white_large_square:'
-
-        text = f'{checkmark} *React to this message!*'
-
-        return {'type': 'section', 'text': {'type': 'mrkdwn', 'text': text}}
-
-
-def send_welcome_message(channel, user):
-    if channel not in welcome_messages:
-        welcome_messages[channel] = {}
-
-    if user in welcome_messages[channel]:
-        return
-
-    welcome = WelcomeMessage(channel)
-    message = welcome.get_message()
-    response = client.chat_postMessage(**message)
-    welcome.timestamp = response['ts']
-
-    welcome_messages[channel][user] = welcome
-
-
-def list_scheduled_messages(channel):
-    response = client.chat_scheduledMessages_list(channel=channel)
-    messages = response.data.get('scheduled_messages')
-    ids = []
-    for msg in messages:
-        ids.append(msg.get('id'))
-
-    return ids
-
-
-def schedule_messages(messages):
-    ids = []
-    for msg in messages:
-        response = client.chat_scheduleMessage(
-            channel=msg['channel'], text=msg['text'], post_at=msg['post_at']).data
-        id_ = response.get('scheduled_message_id')
-        ids.append(id_)
-
-    return ids
-
-
-def delete_scheduled_messages(ids, channel):
-    for _id in ids:
-        try:
-            client.chat_deleteScheduledMessage(
-                channel=channel, scheduled_message_id=_id)
-        except Exception as e:
-            print(e)
-
-
-def check_if_bad_words(message):
-    msg = message.lower()
-    msg = msg.translate(str.maketrans('', '', string.punctuation))
-
-    return any(word in msg for word in BAD_WORDS)
-
-
-@ slack_event_adapter.on('message')
+@slack_event_adapter.on("message")
 def message(payload):
-    event = payload.get('event', {})
-    channel_id = event.get('channel')
-    user_id = event.get('user')
-    text = event.get('text')
+    event = payload.get("event",{})
 
-    if user_id != None and BOT_ID != user_id:
-        if user_id in message_counts:
-            message_counts[user_id] += 1
-        else:
-            message_counts[user_id] = 1
-
-        if text.lower() == 'start':
-            send_welcome_message(f'@{user_id}', user_id)
-        elif check_if_bad_words(text):
-            ts = event.get('ts')
-            client.chat_postMessage(
-                channel=channel_id, thread_ts=ts, text="THAT IS A BAD WORD!")
-
-
-@ slack_event_adapter.on('reaction_added')
-def reaction(payload):
-    event = payload.get('event', {})
-    channel_id = event.get('item', {}).get('channel')
-    user_id = event.get('user')
-
-    if f'@{user_id}' not in welcome_messages:
+    # We're not interested in "message_deleted" events
+    subtype = event.get("subtype")
+    if subtype and subtype == "message_deleted":
         return
+    
+    msg_text = event.get("text")
+    
+    # Does the message mention a meme stock?
+    mentioned_meme_stocks = meme_patt.findall(msg_text)
+    if not mentioned_meme_stocks:
+        # We didn't find any meme stocks, but make sure list
+        # contains one element, for iteration immediately below:
+        mentioned_meme_stocks = [None]
+    
+    # Generate output files
+    for meme in mentioned_meme_stocks:
+        # Give each message file a unique, content-based name
+        timestamp = datetime.utcfromtimestamp(float(event.get("event_ts"))).isoformat()
+        unique_id = str(uuid.uuid4())
+        filename = f"{timestamp.replace(':','-')}__{unique_id}.csv"
+      
+        with open(filename, "a") as f:
+            writer = csv.writer(f, quoting=csv.QUOTE_ALL)
+            writer.writerow([
+                "timestamp",
+                "messageid",
+                "channel",
+                "author",
+                "text",
+                "kind",
+                "symbol"])
+            writer.writerow([
+                timestamp,
+                event.get("client_msg_id"),
+                event.get("channel"),
+                event.get("user"),
+                msg_text,
+                "slack",
+                meme])
 
-    welcome = welcome_messages[f'@{user_id}'][user_id]
-    welcome.completed = True
-    welcome.channel = channel_id
-    message = welcome.get_message()
-    updated_message = client.chat_update(**message)
-    welcome.timestamp = updated_message['ts']
+        # Upload to S3
+        s3.Bucket(BUCKET).upload_file(
+            Key=str(Path(FOLDER, filename)),  # Path() takes care of clean concatenation
+            Filename=filename)
 
-
-@ app.route('/message-count', methods=['POST'])
-def message_count():
-    data = request.form
-    user_id = data.get('user_id')
-    channel_id = data.get('channel_id')
-    message_count = message_counts.get(user_id, 0)
-
-    client.chat_postMessage(
-        channel=channel_id, text=f"Message: {message_count}")
-    return Response(), 200
+        # Tidy up
+        os.remove(filename)
+    
+    # Curious to see what a payload looks like
+    # with open("payloads.txt", "a") as f:
+    #     f.write(json.dumps(payload) + "\n")
 
 
 if __name__ == "__main__":
-    schedule_messages(SCHEDULED_MESSAGES)
-    ids = list_scheduled_messages('C01BXQNT598')
-    delete_scheduled_messages(ids, 'C01BXQNT598')
-    app.run(debug=True)
+    app.run(host='127.0.0.1', port=int(os.environ["CDSW_APP_PORT"]))
