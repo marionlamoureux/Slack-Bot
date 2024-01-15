@@ -1,0 +1,6 @@
+.bash_history
+.Rprofile
+.cache/
+.conda/
+.ipython/
+.pip/
